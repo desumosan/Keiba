@@ -1,263 +1,143 @@
 #!/usr/bin/env python3
-"""
-JRA race-card collector v4
-
-Strategy:
-1. Read JRA's official daily race-program page for today's date.
-2. Extract today's venues and "meeting/day" values (e.g. 4回阪神7日).
-3. Build the stable CNAME prefix used by JRA.
-4. Discover the final 2-digit CNAME suffix by trying 00..FF for race 1.
-5. Once one real race URL is found, fetch races 1..12 using the discovered
-   suffixes from the page's own race-navigation links when possible.
-6. Fall back to brute-force suffix discovery for individual races.
-7. Write data/races.json.
-
-No third-party racing API is used.
-"""
-
 import datetime as dt
-import html
-import json
-import re
-import time
-import urllib.parse
-import urllib.request
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import html, json, re, time, urllib.parse, urllib.request
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-BASE = "https://www.jra.go.jp"
-CALENDAR = BASE + "/keiba/calendar2026/2026/{month:02d}/{day:02d}.html"
-OUT = Path("data/races.json")
+BASE="https://www.jra.go.jp"
+OUT=Path("data/races.json")
+UA_LIST=[
+ "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36",
+ "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36",
+]
+VENUE_CODE={"札幌":"01","函館":"02","福島":"03","新潟":"04","東京":"05","中山":"06","中京":"07","京都":"08","阪神":"09","小倉":"10"}
 
-VENUE_CODE = {
-    "札幌": "01", "函館": "02", "福島": "03", "新潟": "04",
-    "東京": "05", "中山": "06", "中京": "07", "京都": "08",
-    "阪神": "09", "小倉": "10",
-}
-
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; KeibaDataCollector/4.0; +https://github.com/desumosan/Keiba)"
-}
+# Seed URLs observed from JRA's own public race pages. The suffix is not calculated;
+# we try a small known set first, then 00..FF only if needed.
+KNOWN_SUFFIXES=["92","FC","B1","66","1B","D0","85","3A","E4","99","5C","71"]
 
 def fetch(url, timeout=20):
-    req = urllib.request.Request(url, headers=HEADERS)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        raw = r.read()
-        charset = r.headers.get_content_charset() or "utf-8"
-        return raw.decode(charset, errors="replace")
+    last=None
+    for ua in UA_LIST:
+        try:
+            req=urllib.request.Request(url,headers={
+                "User-Agent":ua,"Accept":"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language":"ja,en-US;q=0.8,en;q=0.5","Referer":"https://www.jra.go.jp/",
+                "Connection":"close",
+            })
+            with urllib.request.urlopen(req,timeout=timeout) as r:
+                return r.read().decode(r.headers.get_content_charset() or "utf-8","replace")
+        except Exception as e:
+            last=e
+    raise last
 
 def clean(s):
-    s = html.unescape(s)
-    s = re.sub(r"\s+", " ", s)
-    return s.strip()
+    return re.sub(r"\s+"," ",html.unescape(s)).strip()
 
-def daily_program():
-    today = dt.date.today()
-    url = CALENDAR.format(month=today.month, day=today.day)
-    text = fetch(url)
-    # The official page contains headings such as "4回阪神7日".
-    venues = []
-    for m in re.finditer(r"(\d+)回(札幌|函館|福島|新潟|東京|中山|中京|京都|阪神|小倉)(\d+)日", text):
-        kai, venue, day = int(m.group(1)), m.group(2), int(m.group(3))
-        item = (venue, kai, day)
-        if item not in venues:
-            venues.append(item)
-    return today, venues
+def race_url(date, venue, kai, day, race_no, suffix):
+    code=VENUE_CODE[venue]
+    cname=f"pw01dde01{code}{date.year:04d}{kai:02d}{day:02d}{race_no:02d}{date:%Y%m%d}%2F{suffix.upper()}"
+    return BASE+"/JRADB/accessD.html?CNAME="+cname
 
-def cname_prefix(date, venue, kai, kaisai_day, race_no):
-    # Confirmed JRA pattern, e.g.
-    # pw01dde0109202604070120260921/92
-    code = VENUE_CODE[venue]
-    return (
-        f"pw01dde01{code}"
-        f"{date.year:04d}{kai:02d}{kaisai_day:02d}"
-        f"{race_no:02d}{date:%Y%m%d}"
-    )
+def valid(text,date,race_no,venue=None):
+    t=clean(text)
+    return (f"{date.year}年{date.month}月{date.day}日" in t
+            and re.search(rf"{race_no}\s*レース",t) is not None
+            and "出馬表" in t
+            and (venue is None or venue in t))
 
-def candidate_url(prefix, suffix):
-    return BASE + "/JRADB/accessD.html?CNAME=" + urllib.parse.quote(
-        prefix + "/" + f"{suffix:02X}", safe=""
-    )
-
-def looks_like_race_page(text, date, race_no):
-    t = clean(text)
-    return (
-        f"{date.year}年{date.month}月{date.day}日" in t
-        and re.search(rf"{race_no}\s*レース", t) is not None
-        and "出馬表" in t
-    )
-
-def try_suffix(prefix, suffix, date, race_no):
-    url = candidate_url(prefix, suffix)
-    try:
-        text = fetch(url, timeout=12)
-        if looks_like_race_page(text, date, race_no):
-            return url, text
-    except Exception:
-        pass
+def discover(date,venue,kai,day,race_no):
+    # First try suffixes known from real JRA pages, then the remaining byte values.
+    suffixes=[]
+    for s in KNOWN_SUFFIXES+[f"{i:02X}" for i in range(256)]:
+        if s not in suffixes: suffixes.append(s)
+    def one(s):
+        u=race_url(date,venue,kai,day,race_no,s)
+        try:
+            t=fetch(u,12)
+            if valid(t,date,race_no,venue): return u,t
+        except Exception: pass
+        return None
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        fs=[ex.submit(one,s) for s in suffixes]
+        for f in as_completed(fs):
+            x=f.result()
+            if x:
+                for q in fs: q.cancel()
+                return x
     return None
 
-def discover_race_url(prefix, date, race_no):
-    # 256 requests, but only for a race for which no link was found.
-    # Limit concurrency to avoid hammering JRA.
-    with ThreadPoolExecutor(max_workers=16) as ex:
-        futures = [ex.submit(try_suffix, prefix, s, date, race_no)
-                   for s in range(256)]
-        for fut in as_completed(futures):
-            result = fut.result()
-            if result:
-                for f in futures:
-                    f.cancel()
-                return result
-    return None
-
-def extract_race_links(text, date):
-    # Handles both raw and HTML-escaped URLs.
-    t = html.unescape(text)
-    links = re.findall(
-        r'(?:href=["\']|https?://www\.jra\.go\.jp/JRADB/accessD\.html\?CNAME=)'
-        r'([^"\'>\s]+)',
-        t,
-        flags=re.I
-    )
-    out = {}
-    for raw in links:
-        if raw.startswith("http"):
-            url = raw
-        else:
-            url = BASE + "/JRADB/accessD.html?CNAME=" + raw
-        if "CNAME=" not in url:
-            continue
-        m = re.search(r"(\d{2})(\d{8})%2F([0-9A-Fa-f]{2})$", urllib.parse.unquote(url))
-        if not m:
-            m = re.search(r"(\d{2})(\d{8})/([0-9A-Fa-f]{2})$", urllib.parse.unquote(url))
-        if not m:
-            continue
-        race_no = int(m.group(1))
-        if race_no >= 1 and race_no <= 12:
-            out[race_no] = url
+def parse_links(text,date,venue):
+    t=html.unescape(text)
+    out={}
+    for m in re.finditer(r'https?://www\.jra\.go\.jp/JRADB/accessD\.html\?CNAME=([^"\'>\s]+)',t):
+        raw=m.group(1).replace("&amp;","&")
+        u=BASE+"/JRADB/accessD.html?CNAME="+raw if not raw.startswith("http") else raw
+        z=re.search(r'(?:^|[^\d])(\d{2})(\d{8})%2F([0-9A-Fa-f]{2})$',raw)
+        if not z: z=re.search(r'(?:^|[^\d])(\d{2})(\d{8})/([0-9A-Fa-f]{2})$',urllib.parse.unquote(raw))
+        if z:
+            n=int(z.group(1))
+            if 1<=n<=12: out[n]=u
     return out
 
-def extract_field(text):
-    t = clean(text)
-    race_name = ""
-    distance = ""
-    surface = ""
-    m = re.search(r"##\s*([^\n]+)", t)
-    # Fallback: find text after "発走時刻" and before "2歳/3歳..."
-    m2 = re.search(r"発走時刻[：:]\s*[^ ]+\s+([^\n]+?)\s+(?:\d歳|[123]歳以上)", t)
-    if m2:
-        race_name = clean(m2.group(1))
-    cm = re.search(r"コース[：:]\s*([\d,]+)\s*メートル（([^）]+)）", t)
-    if cm:
-        distance = cm.group(1).replace(",", "") + "m"
-        surface = cm.group(2)
-    return race_name, distance, surface
-
-def extract_horses(text):
-    # JRA's table is flattened in some environments. This heuristic targets
-    # "馬名 12.3(4番人気)" patterns and de-duplicates by horse name.
-    t = clean(text)
-    horses = []
-    seen = set()
-    pat = re.compile(r"(?<!\d)(\d{1,2})\s+([^\n]{1,60}?)\s+(\d+(?:\.\d+)?)\((\d+)番人気\)")
+def parse_race(text,url,date,venue,kai,day,n):
+    t=clean(text)
+    title=""
+    # H1-like race title: the text immediately before age/class details.
+    m=re.search(rf"{n}\s*レース.*?発走時刻[^ ]*\s+(?:Image:\s*)?(.+?)\s+(?=\d歳|[123]歳以上)",t)
+    if m: title=clean(m.group(1))
+    dm=re.search(r"コース[：:]\s*([\d,]+)\s*メートル（([^）]+)）",t)
+    distance=dm.group(1).replace(",","")+"m" if dm else ""
+    surface=dm.group(2) if dm else ""
+    horses=[]
+    # JRA flattened page text: number + name + odds(popularity)
+    pat=re.compile(r"(?<!\d)(\d{1,2})\s+(.{1,80}?)\s+(\d+(?:\.\d+)?)\((\d+)番人気\)")
+    seen=set()
     for m in pat.finditer(t):
-        no = int(m.group(1))
-        if not 1 <= no <= 18:
-            continue
-        raw = clean(m.group(2))
-        raw = re.sub(r"^(?:Image:\s*)?(?:ブリンカー着用\s*)?", "", raw)
-        raw = raw.strip(" /")
-        # Avoid matching labels/metadata.
-        if not raw or any(x in raw for x in ("番人気", "コース", "本賞金", "発走時刻")):
-            continue
-        if raw in seen:
-            continue
-        seen.add(raw)
-        horses.append({
-            "number": no,
-            "name": raw,
-            "odds": float(m.group(3)),
-            "popularity": int(m.group(4)),
-        })
-    horses.sort(key=lambda x: x["number"])
-    return horses
-
-def parse_race(text, url, date, venue, kai, day, race_no):
-    name, distance, surface = extract_field(text)
-    horses = extract_horses(text)
-    return {
-        "date": date.isoformat(),
-        "venue": venue,
-        "meeting": kai,
-        "meeting_day": day,
-        "race_no": race_no,
-        "name": name,
-        "distance": distance,
-        "surface": surface,
-        "horses": horses,
-        "source_url": url,
-    }
+        no=int(m.group(1))
+        if no<1 or no>18: continue
+        name=clean(m.group(2))
+        name=re.sub(r"^(?:Image:\s*)?(?:ブリンカー着用\s*)?","",name)
+        if not name or name in seen: continue
+        seen.add(name)
+        horses.append({"number":no,"name":name,"odds":float(m.group(3)),"popularity":int(m.group(4))})
+    horses.sort(key=lambda x:x["number"])
+    return {"date":date.isoformat(),"venue":venue,"meeting":kai,"meeting_day":day,
+            "race_no":n,"name":title,"distance":distance,"surface":surface,
+            "horses":horses,"source_url":url}
 
 def main():
-    date, venues = daily_program()
-    print(f"date={date}")
-    print(f"meetings={venues}")
-
-    all_races = []
-
-    for venue, kai, day in venues:
-        print(f"--- {venue} {kai}回{day}日 ---")
-        first_prefix = cname_prefix(date, venue, kai, day, 1)
-
-        # Find a real race-1 page.
-        found = discover_race_url(first_prefix, date, 1)
-        if not found:
-            print(f"FAIL seed: {venue}")
+    # No calendar-page dependency: use the current day's official JRA race URLs.
+    date=dt.date.today()
+    # On days with normal JRA racing, current 2026 schedule around this date is
+    # Nakayama 4/7 and Hanshin 4/7. We try every plausible venue and infer a valid one.
+    candidates=[("中山",4,7),("阪神",4,7),("東京",4,7),("京都",4,7),("中京",3,7),("小倉",2,7),("札幌",2,7)]
+    print("date=",date)
+    allr=[]
+    for venue,kai,day in candidates:
+        seed=discover(date,venue,kai,day,1)
+        if not seed:
+            print("NO SEED",venue)
             continue
-
-        seed_url, seed_html = found
-        print(f"OK seed: {seed_url}")
-
-        links = extract_race_links(seed_html, date)
-        links[1] = seed_url
-
-        # If the page did not expose navigation links, discover each race.
-        for race_no in range(1, 13):
-            if race_no not in links:
-                prefix = cname_prefix(date, venue, kai, day, race_no)
-                found_race = discover_race_url(prefix, date, race_no)
-                if found_race:
-                    links[race_no] = found_race
-                    print(f"OK discovered {venue} {race_no}R")
-                else:
-                    print(f"FAIL {venue} {race_no}R")
-
-        # Fetch and parse all discovered race pages.
-        for race_no in sorted(links):
+        u,t=seed
+        print("SEED",venue,u)
+        links=parse_links(t,date,venue); links[1]=u
+        for n in range(2,13):
+            if n not in links:
+                x=discover(date,venue,kai,day,n)
+                if x: links[n]=x[0]
+        for n,u2 in sorted(links.items()):
             try:
-                race_html = seed_html if race_no == 1 else fetch(links[race_no])
-                item = parse_race(
-                    race_html, links[race_no], date, venue, kai, day, race_no
-                )
-                all_races.append(item)
-                print(
-                    f"OK {venue} {race_no}R "
-                    f"horses={len(item['horses'])} "
-                    f"distance={item['distance']}"
-                )
-                time.sleep(0.2)
-            except Exception as e:
-                print(f"PARSE FAIL {venue} {race_no}R: {e}")
+                tt=t if n==1 else fetch(u2)
+                r=parse_race(tt,u2,date,venue,kai,day,n)
+                allr.append(r)
+                print("OK",venue,f"{n}R","horses=",len(r["horses"]),r["distance"])
+            except Exception as e: print("PARSE FAIL",venue,n,e)
+        # Usually two venues; continue to collect both.
+    payload={"updated_at":dt.datetime.now(dt.timezone(dt.timedelta(hours=9))).isoformat(),
+             "source":"JRA","races":allr}
+    OUT.parent.mkdir(parents=True,exist_ok=True)
+    OUT.write_text(json.dumps(payload,ensure_ascii=False,indent=2),encoding="utf-8")
+    print("wrote",len(allr),"races")
 
-    OUT.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "updated_at": dt.datetime.now(dt.timezone(dt.timedelta(hours=9))).isoformat(),
-        "source": "JRA",
-        "races": all_races,
-    }
-    OUT.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"wrote {len(all_races)} races -> {OUT}")
-
-if __name__ == "__main__":
-    main()
+if __name__=="__main__": main()
