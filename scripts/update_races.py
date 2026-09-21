@@ -1,100 +1,139 @@
-import json, re
+import json, re, html
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.request import Request, urlopen
-from html import unescape
+from urllib.parse import urljoin
 
 JST=timezone(timedelta(hours=9))
 BASE="https://www.jra.go.jp"
 OUT=Path("data/races.json")
 
 def get(url):
-    req=Request(url,headers={"User-Agent":"Mozilla/5.0 (compatible; KeibaSite/1.0)"})
-    with urlopen(req,timeout=20) as r:
+    req=Request(url,headers={
+        "User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140 Safari/537.36",
+        "Accept-Language":"ja-JP,ja;q=0.9"
+    })
+    with urlopen(req,timeout=30) as r:
         return r.read().decode("utf-8","ignore")
 
 def clean(s):
-    return re.sub(r"\s+"," ",unescape(re.sub("<[^>]+>"," ",s))).strip()
+    s=html.unescape(s)
+    s=re.sub(r"<[^>]+>"," ",s)
+    return re.sub(r"\s+"," ",s).strip()
 
-def extract_race_links(html):
-    # JRA race pages use /JRADB/accessD.html?CNAME=... .
-    links=re.findall(r'href=["\']([^"\']*JRADB/accessD\.html\?CNAME=[^"\']+)["\']',html)
-    out=[]
-    for x in links:
-        if x.startswith("/"): x=BASE+x
-        elif x.startswith("http"): pass
-        else: x=BASE+"/"+x
-        if x not in out: out.append(x)
-    return out
+def race_links(page):
+    # Do not assume a particular HTML quoting/relative-link format.
+    page=html.unescape(page)
+    found=re.findall(r'(?:href=["\']?[^"\'>\s]*?accessD\.html\?CNAME=|(?:https?:)?//www\.jra\.go\.jp/JRADB/accessD\.html\?CNAME=)([^"\'<>\s&]+)',page)
+    urls=[]
+    for cname in found:
+        url=f"{BASE}/JRADB/accessD.html?CNAME={cname}"
+        if url not in urls and "2026" in cname:
+            urls.append(url)
+    return urls
 
 def parse_race(url):
-    html=get(url)
-    text=clean(html)
-    m=re.search(r"(\d{4}年\d{1,2}月\d{1,2}日).{0,120}?(\d{1,2})レース",text)
-    date=m.group(1) if m else ""
-    race_no=int(m.group(2)) if m else None
+    raw=get(url)
+    text=clean(raw)
+
+    m=re.search(r"(\d{4}年\d{1,2}月\d{1,2}日).*?(\d{1,2})レース",text)
+    if not m:
+        return None
+    race_no=int(m.group(2))
+
+    # The page exposes the meeting, race title, course and weather as text.
+    vm=re.search(r"\d{4}年\d{1,2}月\d{1,2}日.*?(\d+回[^\s]+?\d+日)",text)
+    venue=vm.group(1) if vm else "JRA"
+
+    # Extract title between start time and class/course information.
     title=""
-    tm=re.search(r"発走時刻：\d{1,2}時\d{2}分.{0,120}?<[^>]*>\s*([^<]{2,80})",html)
-    if tm: title=clean(tm.group(1))
+    tm=re.search(r"発走時刻：\d{1,2}時\d{2}分\s*(.*?)\s*(?:\d+歳|2歳|3歳|4歳以上|サラ系)",text)
+    if tm:
+        title=tm.group(1).strip()
     if not title:
-        tm=re.search(r"レース.{0,50}?(\d{1,2}レース)",text)
-    venue=""
-    vm=re.search(r"(\d+回)?([^\s]{2,6})(\d+)日",text)
-    if vm: venue=vm.group(2)
+        tm=re.search(r"発走時刻：\d{1,2}時\d{2}分\s*(.{2,60}?)(?:コース：)",text)
+        if tm: title=tm.group(1).strip()
 
     cm=re.search(r"コース：\s*([\d,]+)メートル（(芝|ダート)[^）]*）",text)
     distance=cm.group(1).replace(",","")+"m" if cm else ""
     surface=cm.group(2) if cm else ""
 
-    # Pull rows from the visible race table. This intentionally keeps parsing conservative.
+    weather=re.search(r"天候([晴曇雨雪]+)",text)
+    track=re.search(r"(芝|ダート)(良|稍重|重|不良)",text)
+    condition=track.group(2) if track else "未取得"
+
     horses=[]
-    row_pat=re.compile(r'>(\d{1,2})<.*?>([^<]{1,30})',re.S)
-    for mm in row_pat.finditer(html):
-        no=int(mm.group(1)); name=clean(mm.group(2))
-        if name and not any(h["horse_no"]==no for h in horses):
-            if not re.search(r"^(枠|馬番|馬名|人気)$",name):
+    # Conservative extraction from table text. The pattern captures horse number + name + odds.
+    # It intentionally accepts names containing Japanese punctuation.
+    pat=re.compile(r"(?:枠\d+\w*\s*)?(\d{1,2})\s+([^\d\s]{1,20})\s+([0-9]+\.[0-9]+)\((\d+)番人気\)")
+    for mm in pat.finditer(text):
+        no=int(mm.group(1)); name=mm.group(2)
+        if not any(x["horse_no"]==no for x in horses):
+            horses.append({
+                "horse_no":no,
+                "horse":name,
+                "odds":float(mm.group(3)),
+                "popularity":int(mm.group(4))
+            })
+
+    # Fallback for new/debut races where the odds are not always present.
+    if not horses:
+        pat2=re.compile(r"(?:枠\d+\w*\s*)?(\d{1,2})\s+([^\d\s]{2,20})\s+(?=\d+\.\d+\()")
+        for mm in pat2.finditer(text):
+            no=int(mm.group(1)); name=mm.group(2)
+            if not any(x["horse_no"]==no for x in horses):
                 horses.append({"horse_no":no,"horse":name})
-    horses=horses[:18]
 
     return {
-      "venue":venue or "JRA",
-      "race_no":race_no or 0,
-      "name":title or f"{race_no or ''}R",
-      "distance":distance,
-      "surface":surface,
-      "track_condition":"未取得",
-      "predictions":[],
-      "horses":horses,
-      "source_url":url,
-      "commentary":"予測エンジン投入前の出馬表データです。"
+        "venue":venue,
+        "race_no":race_no,
+        "name":title or f"{race_no}R",
+        "distance":distance,
+        "surface":surface,
+        "track_condition":condition,
+        "horses":horses,
+        "predictions":[],
+        "commentary":"出馬表取得済み。予測エンジンは次の段階で追加します。",
+        "source_url":url
     }
 
 def main():
-    now=datetime.now(JST)
-    # JRA's current race information page contains links to the active cards.
-    candidates=[]
-    for path in ["/JRADB/accessD.html","/JRA-Info/"]:
+    urls=[]
+    # These pages are JRA's public race-data entry points. Search broadly for CNAME links.
+    for path in ["/JRADB/accessD.html","/JRADB/accessD.html?CNAME=pw01dde1006202604070120260921%2F88"]:
         try:
-            candidates += extract_race_links(get(BASE+path))
-        except Exception:
-            pass
-    # Keep only a manageable set and deduplicate.
+            urls += race_links(get(urljoin(BASE,path)))
+        except Exception as e:
+            print("index fetch failed:",e)
+
+    # Deduplicate and try a larger number than the old version.
+    urls=list(dict.fromkeys(urls))
+    print("candidate race URLs:",len(urls))
+
     races=[]
-    for url in candidates[:80]:
+    for u in urls[:100]:
         try:
-            r=parse_race(url)
-            if r["race_no"]:
+            r=parse_race(u)
+            if r:
                 races.append(r)
         except Exception as e:
-            print("skip",url,e)
-    # Same race can appear multiple times in navigation; dedupe by URL.
+            print("skip",u,e)
+
+    # Keep one record per venue/race number.
     seen=set(); unique=[]
     for r in races:
-        if r["source_url"] not in seen:
-            seen.add(r["source_url"]); unique.append(r)
-    payload={"updated_at":now.isoformat(),"source":"JRA","races":unique[:36]}
+        key=(r["venue"],r["race_no"])
+        if key not in seen:
+            seen.add(key); unique.append(r)
+
+    payload={
+        "updated_at":datetime.now(JST).isoformat(),
+        "source":"JRA",
+        "races":unique
+    }
+    OUT.parent.mkdir(parents=True,exist_ok=True)
     OUT.write_text(json.dumps(payload,ensure_ascii=False,indent=2),encoding="utf-8")
-    print(f"wrote {len(unique[:36])} races")
+    print("wrote",len(unique),"races")
 
 if __name__=="__main__":
     main()
