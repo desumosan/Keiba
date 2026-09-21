@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>3分でわかる競馬予測｜今日の注目レース・本命馬・穴馬</title>
+<meta name="description" content="今日の競馬を3分でチェック。レースごとの本命馬、対抗馬、穴馬、展開・脚質・近走成績などを整理した競馬予測サイトです。">
+<meta name="robots" content="index,follow,max-image-preview:large">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar"><div class="wrap nav">
+  <div class="brand"><span class="dot"></span>3分でわかる競馬予測</div>
+  <div class="date" id="updated">データ確認中…</div>
+</div></header>
+
+<main class="wrap">
+<section class="hero">
+  <p class="eyebrow">TODAY'S KEIBA PREDICTION</p>
+  <h1>今日の競馬、<br><span>3分でつかむ。</span></h1>
+  <p class="lead">レース情報をもとに、展開・脚質・近走成績などを整理。本命馬から穴馬まで、予測理由をわかりやすく表示します。</p>
+  <div class="hero-meta"><span>● 本日の注目レース</span><span id="updatedMeta">データ取得中…</span></div>
+</section>
+
+<section class="quick">
+  <div class="quick-card"><span>分析</span><strong>多要素スコア</strong><small>近走・脚質・展開など</small></div>
+  <div class="quick-card"><span>表示</span><strong>本命・対抗・穴</strong><small>予測理由も確認</small></div>
+  <div class="quick-card"><span>更新</span><strong>自動更新対応</strong><small>JSONデータ方式</small></div>
+</section>
+
+<section class="section">
+  <div class="section-title"><span>01</span><h2>今日の注目レース</h2></div>
+  <div id="raceList"><p>レースを読み込んでいます…</p></div>
+</section>
+
+<section class="section">
+  <div class="section-title"><span>02</span><h2>予測の見方</h2></div>
+  <div class="flow">
+    <div><b>① レース条件</b><span>距離・馬場・頭数</span></div><div class="arrow">→</div>
+    <div><b>② 馬の特徴</b><span>近走・脚質・適性</span></div><div class="arrow">→</div>
+    <div><b>③ 予測スコア</b><span>総合評価を表示</span></div>
+  </div>
+  <p class="note">このサイトのスコアは予測モデル・ルールによる参考情報です。結果を保証するものではありません。</p>
+</section>
+
+<section class="section">
+  <div class="section-title"><span>03</span><h2>30秒用語解説</h2></div>
+  <details><summary>逃げ・先行・差し・追込って？</summary><p>レース中に馬がどの位置で走る傾向があるかを表す脚質です。</p></details>
+  <details><summary>上がり3Fって？</summary><p>レース終盤の600mの走破タイム。末脚の比較材料として使われます。</p></details>
+  <details><summary>馬場状態って？</summary><p>芝やダートの状態を表す情報です。馬によって得意・不得意が異なる場合があります。</p></details>
+</section>
+
+<section class="disclaimer"><b>このサイトについて</b>
+<p>競馬を短時間で分析するための情報整理・予測サイトです。予測は不確実性を含み、的中や利益を保証するものではありません。</p>
+</section>
+</main>
+
+<footer><div class="wrap">© 2026 3分でわかる競馬予測</div></footer>
+
+<script>
+function esc(v){return String(v).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));}
+function date(v){const d=new Date(v);return Number.isNaN(d.getTime())?v:new Intl.DateTimeFormat("ja-JP",{year:"numeric",month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit"}).format(d);}
+function badge(type){return type==="本命"?"◎":type==="対抗"?"○":type==="穴"?"▲":"△";}
+fetch("data/races.json?ts="+Date.now()).then(r=>r.json()).then(data=>{
+ document.getElementById("updated").textContent="更新："+date(data.updated_at);
+ document.getElementById("updatedMeta").textContent="データ更新："+date(data.updated_at);
+ document.getElementById("raceList").innerHTML=(data.races||[]).map(r=>`
+ <article class="race-card">
+  <div class="race-head"><div><span class="venue">${esc(r.venue)}</span><span class="race-no">${esc(r.race_no)}R</span></div><div class="condition">${esc(r.distance)}・${esc(r.surface)}・${esc(r.track_condition)}</div></div>
+  <h3>${esc(r.name)}</h3>
+  <div class="prediction-grid">${r.predictions.map(p=>`
+   <div class="horse ${p.type==="本命"?"main":""}">
+    <div class="horse-top"><span class="prediction-badge">${badge(p.type)}</span><span>${esc(p.type)}</span></div>
+    <strong>${esc(p.horse_no)}番 ${esc(p.horse)}</strong>
+    <div class="score">予測スコア <b>${esc(p.score)}</b></div>
+    <p>${esc(p.reason)}</p>
+   </div>`).join("")}</div>
+  <div class="race-note"><b>展開メモ：</b>${esc(r.commentary)}</div>
+ </article>`).join("");
+}).catch(e=>{document.getElementById("raceList").innerHTML="<p>データの読み込みに失敗しました。</p>";console.error(e);});
+</script>
+</body>
+</html>
